@@ -86,24 +86,27 @@ class Detector:
             time.sleep(FRAME_READ_SLEEP)
         return None, (time.time() - start) * 1000.0
 
-    def _detect_once(self):
-        """
-        Attempt one camera detection cycle.
-        Returns dict with: raw, reason, backend, startup_ms, face_count, motion_score.
-        """
-        cv2, cascade = _get_cv2()
-        cap, backend = self._open_capture(cv2)
-        fail = {
+    @staticmethod
+    def _make_result(reason, backend="unknown", startup_ms=0.0, **overrides):
+        """Build a detection result dict with sensible defaults."""
+        base = {
             "raw": None,
-            "reason": "",
+            "reason": reason,
             "backend": backend,
-            "startup_ms": 0.0,
+            "startup_ms": startup_ms,
             "face_count": 0,
             "motion_score": 0.0,
         }
+        base.update(overrides)
+        return base
+
+    def _detect_once(self):
+        """Attempt one camera detection cycle."""
+        cv2, cascade = _get_cv2()
+        cap, backend = self._open_capture(cv2)
+
         if not cap.isOpened():
-            fail["reason"] = "open_failed"
-            return fail
+            return self._make_result("open_failed", backend)
 
         try:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
@@ -112,32 +115,27 @@ class Detector:
             first_frame, startup_ms = self._wait_for_valid_frame(
                 cap, CAMERA_STARTUP_TIMEOUT
             )
-            fail["startup_ms"] = startup_ms
             if first_frame is None:
-                fail["reason"] = "startup_timeout"
-                return fail
+                return self._make_result("startup_timeout", backend, startup_ms)
 
-            # Warmup: read frames to let NexiGo auto-exposure settle
             for _ in range(WARMUP_FRAMES):
                 cap.read()
 
-            # Capture frame A (post-warmup)
             frame_a, _ = self._wait_for_valid_frame(cap, CAMERA_SECOND_FRAME_TIMEOUT)
             if frame_a is None:
-                fail["reason"] = "frame_a_post_warmup_failed"
-                return fail
+                return self._make_result(
+                    "frame_a_post_warmup_failed", backend, startup_ms
+                )
             gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
 
             for _ in range(DISCARD_FRAMES):
                 ret, _frame = cap.read()
                 if not ret:
-                    fail["reason"] = "discard_failed"
-                    return fail
+                    return self._make_result("discard_failed", backend, startup_ms)
 
             frame_b, _ = self._wait_for_valid_frame(cap, CAMERA_SECOND_FRAME_TIMEOUT)
             if frame_b is None:
-                fail["reason"] = "frame_b_failed"
-                return fail
+                return self._make_result("frame_b_failed", backend, startup_ms)
             gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
 
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -147,41 +145,27 @@ class Detector:
             )
             face_count = len(faces)
             motion_score = float(cv2.absdiff(gray_a, gray_b).mean())
-            raw = bool(face_count > 0 or motion_score > 3.0)
-            return {
-                "raw": raw,
-                "reason": "ok",
-                "backend": backend,
-                "startup_ms": startup_ms,
-                "face_count": face_count,
-                "motion_score": motion_score,
-            }
+            raw = face_count > 0 or motion_score > 3.0
+            return self._make_result(
+                "ok",
+                backend,
+                startup_ms,
+                raw=raw,
+                face_count=face_count,
+                motion_score=motion_score,
+            )
         finally:
             cap.release()
 
     def detect(self):
         """Returns dict with smoothed result and detection diagnostics."""
-        last_result = {
-            "raw": None,
-            "reason": "unknown",
-            "backend": "unknown",
-            "startup_ms": 0.0,
-            "face_count": 0,
-            "motion_score": 0.0,
-        }
+        last_result = self._make_result("unknown")
         for attempt in range(1, DETECT_MAX_ATTEMPTS + 1):
             try:
                 result = self._detect_once()
             except Exception:
                 logging.exception("detect() attempt failed with exception")
-                result = {
-                    "raw": None,
-                    "reason": "exception",
-                    "backend": "unknown",
-                    "startup_ms": 0.0,
-                    "face_count": 0,
-                    "motion_score": 0.0,
-                }
+                result = self._make_result("exception")
 
             if result["raw"] is not None:
                 smoothed = self._smooth(result["raw"])
@@ -253,7 +237,6 @@ class DataStore:
         if not force and (now - self._last_flush) < FLUSH_INTERVAL:
             return
         self._last_flush = now
-        # Atomic write: write to temp, then rename
         fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
@@ -285,21 +268,15 @@ class DataStore:
         now_ts = now.isoformat(timespec="seconds")
         hour_key = str(now.hour)
 
-        # Update hourly
         today["hourly"][hour_key] = today["hourly"].get(hour_key, 0) + DETECT_INTERVAL
 
-        # Update sessions
         sessions = today["sessions"]
-        if sessions:
-            last = sessions[-1]
-            last_end = datetime.fromisoformat(last["end"])
-            gap = (now - last_end).total_seconds()
-            if gap < SESSION_GAP:
-                # Continue current session
-                last["end"] = now_ts
-            else:
-                # New session
-                sessions.append({"start": now_ts, "end": now_ts})
+        if (
+            sessions
+            and (now - datetime.fromisoformat(sessions[-1]["end"])).total_seconds()
+            < SESSION_GAP
+        ):
+            sessions[-1]["end"] = now_ts
         else:
             sessions.append({"start": now_ts, "end": now_ts})
 
@@ -398,16 +375,12 @@ class OverwatchApp(rumps.App):
         self._last_debug_info = None  # last detection result dict
         self._build_menu()
 
-        # Set icon if available
         icon_path = Path(__file__).parent / "assets" / "icon.png"
         if icon_path.exists():
             self.icon = str(icon_path)
 
-        # 1s timer keeps UI responsive; actual detection still happens every DETECT_INTERVAL
         self.timer = rumps.Timer(self._tick, UI_TICK_INTERVAL)
         self.timer.start()
-
-        # Update menu every tick
         self._update_title()
 
     def _build_menu(self):
@@ -519,17 +492,14 @@ class OverwatchApp(rumps.App):
         total = today.get("total_seconds", 0)
         sessions = today.get("sessions", [])
 
-        # Today stats
         if "today_stats" in self.menu:
             self.menu["today_stats"].title = (
                 f"Today: {fmt_duration(total)} / {fmt_duration(DAILY_GOAL)} goal"
             )
 
-        # Progress bar
         if "progress" in self.menu:
             self.menu["progress"].title = f"[{progress_bar(total, DAILY_GOAL)}]"
 
-        # Status
         if "status_line" in self.menu:
             if self.paused:
                 status = "Paused"
@@ -543,11 +513,9 @@ class OverwatchApp(rumps.App):
                 status = "Camera unavailable"
             self.menu["status_line"].title = f"Status: {status}"
 
-        # Current session duration (only show if currently present)
         if "session_line" in self.menu:
             if sessions and self._status is True:
-                last = sessions[-1]
-                start = datetime.fromisoformat(last["start"])
+                start = datetime.fromisoformat(sessions[-1]["start"])
                 dur = (datetime.now() - start).total_seconds()
                 self.menu["session_line"].title = (
                     f"Current session: {fmt_duration(dur)}"
@@ -555,25 +523,22 @@ class OverwatchApp(rumps.App):
             else:
                 self.menu["session_line"].title = "Current session: --"
 
-        # Week total
         if "week_line" in self.menu:
             week = self.store.get_week_total()
             self.menu["week_line"].title = f"This week: {fmt_duration(week)}"
 
-        # Streak
         if "streak_line" in self.menu:
             streak = self.store.get_streak()
             best = self.store.get_best_streak()
             self.menu["streak_line"].title = f"Streak: {streak} days (best: {best})"
 
-        # Sessions list
         if "sessions_header" in self.menu:
             if sessions:
                 lines = ["Sessions today:"]
-                for s in sessions:
+                for i, s in enumerate(sessions):
                     start = datetime.fromisoformat(s["start"])
                     end = datetime.fromisoformat(s["end"])
-                    is_active = s == sessions[-1] and self._status
+                    is_active = i == len(sessions) - 1 and self._status
                     dur = (
                         (datetime.now() - start).total_seconds()
                         if is_active
@@ -587,7 +552,6 @@ class OverwatchApp(rumps.App):
             else:
                 self.menu["sessions_header"].title = "No sessions yet"
 
-        # Next check countdown
         if "next_check" in self.menu:
             if self._next_check:
                 remaining = max(0, int(self._next_check - time.time()))
@@ -595,7 +559,6 @@ class OverwatchApp(rumps.App):
             else:
                 self.menu["next_check"].title = "Next check in: --"
 
-        # Debug info
         if "debug_info" in self.menu:
             if self._debug_mode and self._last_debug_info:
                 d = self._last_debug_info
@@ -605,12 +568,11 @@ class OverwatchApp(rumps.App):
                     else ("Away" if d["raw"] is False else "Failed")
                 )
                 hist = [("T" if h else "F") for h in d.get("history", [])]
-                smoothed_label = d.get("smoothed")
                 self.menu["debug_info"].title = (
                     f"Camera: idx={CAMERA_INDEX} backend={d['backend']}\n"
                     f"Faces: {d['face_count']}  Motion: {d['motion_score']:.1f}  Raw: {raw_label}\n"
                     f"Attempt: {d.get('attempt', '?')}/{DETECT_MAX_ATTEMPTS}  startup={d['startup_ms']:.0f}ms\n"
-                    f"History: [{','.join(hist)}] -> {smoothed_label}"
+                    f"History: [{','.join(hist)}] -> {d.get('smoothed')}"
                 )
             else:
                 self.menu["debug_info"].title = ""
